@@ -1,0 +1,38 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Android build outputs
+*.apk
+*.aab
+*.ap_
+*.dex
+release/
+
+# Local config (machine-specific SDK path, keystores, secrets)
+local.properties
+*.jks
+*.keystore
+keystore.properties
+
+# IDE — Android Studio / IntelliJ
+.idea/
+*.iml
+*.ipr
+*.iws
+.navigation/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Kotlin / misc
+*.hprof
+.kotlin/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code local artifacts
+.claude/

@@ -1,0 +1,402 @@
+package com.billtt.riddle
+
+import android.app.Activity
+import android.graphics.Rect
+import android.util.Log
+import android.widget.Toast
+import com.onyx.android.sdk.pen.RawInputCallback
+import com.onyx.android.sdk.pen.TouchHelper
+import com.onyx.android.sdk.data.note.TouchPoint
+import com.onyx.android.sdk.pen.data.TouchPointList
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+
+/**
+ * State machine: writing -> ink absorption -> awaiting reply -> reply reveal ->
+ * linger -> reply fade -> writing.
+ *
+ * During writing, pen points arrive via TouchHelper (app-render mode; see attach())
+ * and are drawn live in software by DiaryView. When idle is detected the raw pen is
+ * disabled and the fade animations run via DiaryView + e-ink DU4 fast refresh.
+ */
+class DiaryController(
+    private val activity: Activity,
+    private val view: DiaryView,
+    private val prefs: Prefs,
+) {
+
+    enum class State { WRITING, ABSORBING, AWAITING_REPLY, REVEALING, LINGERING, FADING_REPLY }
+
+    @Volatile var state = State.WRITING
+        private set
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var touchHelper: TouchHelper? = null
+    private var cycleJob: Job? = null
+    @Volatile private var skipLingerRequested = false
+
+    // The stroke currently being written (accumulated from move callbacks; used as a
+    // fallback on pen-up if the full point list wasn't delivered).
+    private val pendingPoints = ArrayList<StrokePoint>()
+
+    private val idleRunnable = Runnable { onIdle() }
+
+    // ------------------------------------------------------------- lifecycle
+
+    /** Call after the view is laid out; if the size is still 0, defer until layout completes. */
+    fun attach() {
+        if (view.width == 0 || view.height == 0) {
+            Log.i(TAG, "attach: view not laid out yet (${view.width}x${view.height}), deferring")
+            view.addOnLayoutChangeListener(object : android.view.View.OnLayoutChangeListener {
+                override fun onLayoutChange(
+                    v: android.view.View, l: Int, t: Int, r: Int, b: Int,
+                    ol: Int, ot: Int, or_: Int, ob: Int,
+                ) {
+                    if (v.width > 0 && v.height > 0) {
+                        v.removeOnLayoutChangeListener(this)
+                        attach()
+                    }
+                }
+            })
+            return
+        }
+        val limit = Rect(0, 0, view.width, view.height)
+        val ok = runCatching {
+            // On this device only the app-render mode (FEATURE_APP_TOUCH_RENDER) delivers
+            // pen-point callbacks; the default SurfaceFlinger hardware-draw mode does not
+            // fire callbacks under this firmware. Live ink during writing is therefore
+            // drawn in software by DiaryView (see the move callback / addLivePoint).
+            touchHelper = TouchHelper.create(view, TouchHelper.FEATURE_APP_TOUCH_RENDER, rawCallback)
+                .setStrokeWidth(view.baseStrokeWidth)
+                .setStrokeStyle(TouchHelper.STROKE_STYLE_PENCIL)
+                .setLimitRect(limit, ArrayList())
+                .openRawDrawing()
+            touchHelper?.setRawInputReaderEnable(true)
+            touchHelper?.setRawDrawingRenderEnabled(true)
+            touchHelper?.setRawDrawingEnabled(true)
+        }.isSuccess
+        Log.i(TAG, "attach: limit=$limit touchHelper=${if (touchHelper != null) "ok" else "null"} ok=$ok")
+        if (!ok) {
+            touchHelper = null
+            Toast.makeText(activity, R.string.toast_not_boox, Toast.LENGTH_LONG).show()
+        }
+        EInk.beginAnimation(view)
+    }
+
+    /** Resume writing: re-enable raw pen input, only in the writing state. Called when the
+     *  window regains focus / a dialog is dismissed. */
+    fun onResume() {
+        Log.i(TAG, "onResume: state=$state touchHelper=${touchHelper != null}")
+        if (state == State.WRITING) {
+            touchHelper?.setRawDrawingRenderEnabled(true)
+            touchHelper?.setRawDrawingEnabled(true)
+        }
+    }
+
+    fun onPause() {
+        touchHelper?.setRawDrawingEnabled(false)
+        view.removeCallbacks(idleRunnable)
+    }
+
+    fun onDestroy() {
+        runCatching { touchHelper?.closeRawDrawing() }
+        scope.cancel()
+    }
+
+    // ------------------------------------------- debug touch input (non-BOOX)
+
+    /** True when the raw pen driver is unavailable (emulator); fall back to touch events. */
+    val debugTouchFallback: Boolean get() = touchHelper == null
+
+    fun debugAddPoint(x: Float, y: Float, pressure: Float, up: Boolean) {
+        if (state != State.WRITING) return
+        pendingPoints.add(StrokePoint(x, y, pressure))
+        if (up) {
+            view.addStroke(Stroke(ArrayList(pendingPoints)))
+            pendingPoints.clear()
+            EInk.animateFrame(view)
+            scheduleIdleCheck()
+        }
+    }
+
+    /** Any touch during the linger phase makes the reply fade early. */
+    fun requestSkipLinger() {
+        if (state == State.LINGERING) skipLingerRequested = true
+    }
+
+    // --------------------------------------------------------- raw pen callbacks
+    // Note: these fire on Onyx SDK background threads and are all posted to the main thread.
+
+    private val rawCallback = object : RawInputCallback() {
+
+        override fun onBeginRawDrawing(shortcut: Boolean, point: TouchPoint) {
+            val p = StrokePoint(point.x, point.y, normalizePressure(point.pressure))
+            view.post {
+                view.removeCallbacks(idleRunnable)
+                pendingPoints.clear()
+                view.beginLiveStroke()
+                pendingPoints.add(p)
+                view.addLivePoint(p)
+            }
+        }
+
+        override fun onRawDrawingTouchPointMoveReceived(point: TouchPoint) {
+            val p = StrokePoint(point.x, point.y, normalizePressure(point.pressure))
+            view.post {
+                pendingPoints.add(p)
+                view.addLivePoint(p)   // live partial draw + local fast refresh
+            }
+        }
+
+        override fun onRawDrawingTouchPointListReceived(pointList: TouchPointList) {
+            val pts = pointList.points.map {
+                StrokePoint(it.x, it.y, normalizePressure(it.pressure))
+            }
+            view.post {
+                view.addStroke(Stroke(pts))
+                pendingPoints.clear()
+            }
+        }
+
+        override fun onEndRawDrawing(outLimitRegion: Boolean, point: TouchPoint) {
+            Log.i(TAG, "onEndRawDrawing strokes=${view.strokes.size} pending=${pendingPoints.size}")
+            view.post {
+                if (view.strokes.isEmpty() && pendingPoints.size >= 2) {
+                    view.addStroke(Stroke(ArrayList(pendingPoints)))
+                }
+                pendingPoints.clear()
+                view.endLiveStroke()   // clear live stroke and redraw (final stroke is in strokes)
+                scheduleIdleCheck()
+            }
+        }
+
+        override fun onBeginRawErasing(shortcut: Boolean, point: TouchPoint) {
+            view.post { view.removeCallbacks(idleRunnable) }
+        }
+
+        override fun onRawErasingTouchPointMoveReceived(point: TouchPoint) {}
+
+        override fun onRawErasingTouchPointListReceived(pointList: TouchPointList) {
+            val pts = pointList.points.map { StrokePoint(it.x, it.y, 1f) }
+            view.post {
+                if (view.eraseAt(pts, ERASER_RADIUS)) refreshAfterErase()
+                scheduleIdleCheck()
+            }
+        }
+
+        override fun onEndRawErasing(outLimitRegion: Boolean, point: TouchPoint) {
+            view.post { scheduleIdleCheck() }
+        }
+    }
+
+    private fun normalizePressure(raw: Float): Float =
+        (raw / MAX_PRESSURE).coerceIn(0.05f, 1f)
+
+    /** After erasing, briefly leave raw pen mode to redraw the remaining strokes and full-refresh. */
+    private fun refreshAfterErase() {
+        touchHelper?.setRawDrawingEnabled(false)
+        view.invalidate()          // redraw remaining strokes (erased ones are gone)
+        EInk.fullRefresh(view)     // GC full refresh to clear ghosting of erased ink
+        view.postDelayed({
+            if (state == State.WRITING) touchHelper?.setRawDrawingEnabled(true)
+        }, 300)
+    }
+
+    // ------------------------------------------------------------- idle detection
+
+    private fun scheduleIdleCheck() {
+        view.removeCallbacks(idleRunnable)
+        if (state == State.WRITING && view.strokes.isNotEmpty()) {
+            view.postDelayed(idleRunnable, IDLE_MS)
+        }
+    }
+
+    private fun onIdle() {
+        if (state != State.WRITING || view.strokes.isEmpty()) return
+        startCycle()
+    }
+
+    // --------------------------------------------------------- main cycle (one round)
+
+    private fun startCycle() {
+        state = State.ABSORBING
+        skipLingerRequested = false
+        touchHelper?.setRawDrawingEnabled(false)
+
+        cycleJob = scope.launch {
+            // Take over the on-screen ink with software rendering (same content as live ink).
+            EInk.animateFrame(view)
+            delay(FRAME_MS)
+
+            // Fire the AI request immediately, so recognition runs in parallel with the absorb animation.
+            val png = withContext(Dispatchers.Default) { view.capturePagePng() }
+            val oracle = OracleFactory.create(prefs)
+            val replyDeferred = oracle?.let {
+                async(Dispatchers.IO) {
+                    runCatching { it.ask(png) }
+                }
+            }
+
+            animateAbsorb()
+            view.clearStrokes()
+            EInk.fullRefresh(view)
+
+            state = State.AWAITING_REPLY
+            val reply: String = when {
+                replyDeferred == null -> activity.getString(R.string.toast_need_key)
+                else -> {
+                    val result = runCatching {
+                        withTimeout(REPLY_TIMEOUT_MS) { replyDeferred.await() }
+                    }.getOrNull()
+                    result?.getOrNull() ?: silentReply(result?.exceptionOrNull())
+                }
+            }
+
+            state = State.REVEALING
+            view.setReply(reply)
+            animateReveal()
+
+            state = State.LINGERING
+            lingerInterruptibly(lingerMillisFor(view.replyWords.size))
+
+            state = State.FADING_REPLY
+            animateReplyFade()
+            view.clearReply()
+            EInk.fullRefresh(view)
+
+            state = State.WRITING
+            touchHelper?.setRawDrawingEnabled(true)
+        }
+    }
+
+    private fun silentReply(cause: Throwable?): String {
+        cause?.let {
+            Toast.makeText(activity, "API error: ${it.message}", Toast.LENGTH_LONG).show()
+        }
+        return "……"
+    }
+
+    // ------------------------------------------------------------- animations
+    //
+    // E-ink refresh is slow, so a continuous per-frame gradient stutters. Ink level is
+    // quantized to 5 steps; we scan the timeline with a fine sample step and only issue
+    // a real DU4 fast refresh when some element crosses a step — every refresh is a
+    // visible grayscale jump, dead frames are skipped, and the result is a crisp,
+    // stepped absorb / reveal.
+
+    /** Quantize to steps 0..4, consistent with DiaryView's quantization. */
+    private fun level(a: Float): Int = Math.round(a.coerceIn(0f, 1f) * 4f)
+
+    /**
+     * Generic stepped-fade driver.
+     * @param count   number of elements
+     * @param totalMs total curve duration
+     * @param setA    write element i's ink level in place
+     * @param curve   given element i and time t, return its target level in [0,1]
+     */
+    private suspend fun runStagedFade(
+        count: Int, totalMs: Long, setA: (Int, Float) -> Unit, curve: (Int, Long) -> Float,
+    ) {
+        if (count == 0) return
+        val prev = IntArray(count) { Int.MIN_VALUE }
+        var t = 0L
+        while (t <= totalMs) {
+            var changed = false
+            for (i in 0 until count) {
+                val a = curve(i, t)
+                setA(i, a)
+                val lv = level(a)
+                if (lv != prev[i]) { prev[i] = lv; changed = true }
+            }
+            if (changed) {
+                EInk.animateFrame(view)
+                delay(FRAME_MS)
+            }
+            t += SAMPLE_MS
+        }
+    }
+
+    /**
+     * Ink absorption: split the strokes into bands in write order (offscreen bitmaps)
+     * and fade the bands out with a stagger. Keeps the "absorbed head to tail" ordering
+     * while drawing only a few bitmaps per frame — continuous and smooth.
+     */
+    private suspend fun animateAbsorb() {
+        if (view.strokes.isEmpty()) return
+        view.prepareAbsorb()
+        val k = view.absorbBandAlphas.size
+        if (k == 0) return
+        val totalMs = ABSORB_BAND_STAGGER_MS * (k - 1) + ABSORB_BAND_FADE_MS
+        runStagedFade(k, totalMs, { i, a -> view.absorbBandAlphas[i] = a }) { i, t ->
+            val local = (t - i * ABSORB_BAND_STAGGER_MS).coerceAtLeast(0L)
+            (1f - local.toFloat() / ABSORB_BAND_FADE_MS).coerceIn(0f, 1f)
+        }
+        view.finishAbsorb()
+    }
+
+    /** Reply reveal: words rise in order from faint gray to full ink. */
+    private suspend fun animateReveal() {
+        val n = view.replyWords.size
+        runStagedFade(n, REVEAL_WORD_MS * (n - 1) + FADE_MS, { i, a -> view.wordAlphas[i] = a }) { i, t ->
+            val local = (t - i * REVEAL_WORD_MS).coerceAtLeast(0L)
+            (local.toFloat() / FADE_MS).coerceIn(0f, 1f)
+        }
+        for (i in 0 until n) view.wordAlphas[i] = 1f
+        EInk.animateFrame(view)
+    }
+
+    /** Reply fade: the reverse of reveal — words sink back into the page in order. */
+    private suspend fun animateReplyFade() {
+        val n = view.replyWords.size
+        val stagger = if (n > 0) (ABSORB_TOTAL_STAGGER_MS / n).coerceIn(50L, REVEAL_WORD_MS) else 0L
+        runStagedFade(n, stagger * (n - 1) + FADE_MS, { i, a -> view.wordAlphas[i] = a }) { i, t ->
+            val local = (t - i * stagger).coerceAtLeast(0L)
+            (1f - local.toFloat() / FADE_MS).coerceIn(0f, 1f)
+        }
+    }
+
+    private fun lingerMillisFor(wordCount: Int): Long =
+        (1000L + wordCount * 110L).coerceIn(1800L, 9000L)
+
+    private suspend fun lingerInterruptibly(millis: Long) {
+        var waited = 0L
+        while (waited < millis && !skipLingerRequested) {
+            delay(120)
+            waited += 120
+        }
+    }
+
+    companion object {
+        const val TAG = "RiddleDiary"
+
+        /** How long the pen must rest to count as "a passage finished" and trigger absorption
+         *  (the original riddle project uses 2.8s). */
+        const val IDLE_MS = 2800L
+
+        /** Minimum interval after each real refresh — DU4 fast refresh is ~150ms. */
+        const val FRAME_MS = 130L
+
+        /** Timeline sampling step (does not refresh; only used to detect step crossings). */
+        const val SAMPLE_MS = 30L
+
+        const val FADE_MS = 420L                  // reply: one word from full to 0 (or reverse)
+        const val ABSORB_BAND_FADE_MS = 300L      // absorb: one band from full down to 0
+        const val ABSORB_BAND_STAGGER_MS = 75L    // absorb: gap between adjacent bands starting to fade (ordering)
+        const val ABSORB_TOTAL_STAGGER_MS = 1100L // reply fade: total stagger budget
+        const val ABSORB_STAGGER_MAX_MS = 90L
+
+        const val REVEAL_WORD_MS = 55L            // gap between adjacent words starting to reveal
+
+        const val REPLY_TIMEOUT_MS = 150_000L
+        const val ERASER_RADIUS = 24f
+        const val MAX_PRESSURE = 4096f
+    }
+}

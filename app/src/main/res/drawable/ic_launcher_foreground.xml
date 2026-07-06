@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 一滴正在被纸吸收的墨 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#1B1B1B"
+        android:pathData="M54,26 C58,38 70,48 70,60 A16,16 0 0 1 38,60 C38,48 50,38 54,26 Z" />
+    <path
+        android:fillColor="#55000000"
+        android:pathData="M54,78 m-2,0 a2,2 0 1 0 4,0 a2,2 0 1 0 -4,0" />
+</vector>

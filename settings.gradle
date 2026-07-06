@@ -1,0 +1,24 @@
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+        // Onyx BOOX SDK 官方仓库（仅提供 http）
+        maven {
+            url 'http://repo.boox.com/repository/maven-public/'
+            allowInsecureProtocol = true
+        }
+        maven { url 'https://jitpack.io' }
+    }
+}
+
+rootProject.name = 'boox-riddle'
+include ':app'

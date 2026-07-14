@@ -67,6 +67,9 @@ class DiaryView(context: Context) : View(context) {
         /** Throttle interval (ms) for the local live-ink refresh. */
         const val LIVE_THROTTLE_MS = 20L
 
+        /** Blood-red ink for *accented* reply words (saturated red reads best on Kaleido). */
+        val ACCENT_INK = Color.rgb(165, 18, 18)
+
         /** Number of bands the absorb animation splits strokes into, in write order
          *  (more = finer ordering, a few more bitmaps drawn per frame). */
         const val ABSORB_BANDS = 10
@@ -277,8 +280,9 @@ class DiaryView(context: Context) : View(context) {
         for (i in replyWords.indices) {
             val alpha = quantizeAlpha(wordAlphas[i])
             if (alpha <= 0.02f) continue
-            textPaint.alpha = (alpha * 255).toInt()
             val w = replyWords[i]
+            textPaint.color = if (w.accent) ACCENT_INK else Color.BLACK
+            textPaint.alpha = (alpha * 255).toInt()
             canvas.drawText(w.text, w.x, w.y, textPaint)
         }
     }

@@ -3,7 +3,7 @@ package com.billtt.riddle
 import android.graphics.Paint
 
 /** One animatable unit after layout: one CJK character, or one Western word. */
-data class ReplyWord(val text: String, val x: Float, val y: Float)
+data class ReplyWord(val text: String, val x: Float, val y: Float, val accent: Boolean = false)
 
 data class ReplyLayout(val words: List<ReplyWord>, val textSizePx: Float, val isCjk: Boolean)
 
@@ -44,8 +44,23 @@ object ReplyTypesetter {
     private fun isTrailingPunct(c: Char): Boolean =
         c in "，。！？；：、”’）》…—,.!?;:)\"'"
 
+    /** Extract *marked* accent spans; returns (clean text, accent spans). Odd asterisk
+     *  counts are treated as no markers so a stray star never leaks into the page. */
+    private fun parseMarkers(raw: String): Pair<String, List<String>> {
+        val spans = if (raw.count { it == '*' } >= 2)
+            Regex("\\*([^*]{1,24})\\*").findAll(raw).map { it.groupValues[1] }.toList()
+        else emptyList()
+        return raw.replace("*", "") to spans
+    }
+
     fun layout(text: String, pageWidth: Int, pageHeight: Int, paint: Paint): ReplyLayout {
-        val cjk = containsCjk(text)
+        val (clean, spans) = parseMarkers(text)
+        val cjk = containsCjk(clean)
+        val accentTokens = spans.flatMap { it.split(' ') }.filter { it.isNotEmpty() }.toSet()
+        val accentChars = spans.flatMap { it.toList() }.toSet()
+        fun isAccent(token: String): Boolean =
+            if (cjk) token.firstOrNull() in accentChars
+            else token.trimEnd { isTrailingPunct(it) } in accentTokens
         // Tangerine's x-height is small; western text needs a larger base size
         var textSize = if (cjk) pageWidth / 24f else pageWidth / 18f
         val maxWidth = pageWidth * 0.78f
@@ -55,7 +70,8 @@ object ReplyTypesetter {
         var words: List<ReplyWord>
         while (true) {
             paint.textSize = textSize
-            words = flow(tokenize(text, cjk), cjk, maxWidth, pageWidth, topStart, paint)
+            val toks = tokenize(clean, cjk).map { it to isAccent(it) }
+            words = flow(toks, cjk, maxWidth, pageWidth, topStart, paint)
             val bottom = words.lastOrNull()?.y ?: topStart
             if (bottom <= maxBottom || textSize <= (if (cjk) pageWidth / 40f else pageWidth / 30f)) break
             textSize *= 0.88f
@@ -64,34 +80,36 @@ object ReplyTypesetter {
     }
 
     /** Fill line by line and horizontally center each line. */
+    private data class Tok(val text: String, val width: Float, val accent: Boolean)
+
     private fun flow(
-        tokens: List<String>, cjk: Boolean, maxWidth: Float,
+        tokens: List<Pair<String, Boolean>>, cjk: Boolean, maxWidth: Float,
         pageWidth: Int, topStart: Float, paint: Paint,
     ): List<ReplyWord> {
         val spaceW = if (cjk) 0f else paint.measureText(" ")
         val lineHeight = paint.textSize * 1.7f
-        val lines = mutableListOf<MutableList<Pair<String, Float>>>() // (token, width)
-        var line = mutableListOf<Pair<String, Float>>()
+        val lines = mutableListOf<MutableList<Tok>>()
+        var line = mutableListOf<Tok>()
         var lineW = 0f
-        for (t in tokens) {
+        for ((t, acc) in tokens) {
             val w = paint.measureText(t)
             val extra = if (line.isEmpty()) w else w + spaceW
             if (lineW + extra > maxWidth && line.isNotEmpty()) {
                 lines.add(line); line = mutableListOf(); lineW = 0f
             }
             lineW += if (line.isEmpty()) w else w + spaceW
-            line.add(t to w)
+            line.add(Tok(t, w, acc))
         }
         if (line.isNotEmpty()) lines.add(line)
 
         val words = mutableListOf<ReplyWord>()
         var y = topStart
         for (l in lines) {
-            val totalW = l.sumOf { it.second.toDouble() }.toFloat() + spaceW * (l.size - 1)
+            val totalW = l.sumOf { it.width.toDouble() }.toFloat() + spaceW * (l.size - 1)
             var x = (pageWidth - totalW) / 2f
-            for ((t, w) in l) {
-                words.add(ReplyWord(t, x, y))
-                x += w + spaceW
+            for (tok in l) {
+                words.add(ReplyWord(tok.text, x, y, tok.accent))
+                x += tok.width + spaceW
             }
             y += lineHeight
         }

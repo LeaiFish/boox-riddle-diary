@@ -6,6 +6,9 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.BitmapShader
+import android.graphics.RadialGradient
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.os.SystemClock
 import android.view.View
@@ -58,6 +61,76 @@ class DiaryView(context: Context) : View(context) {
         color = Color.BLACK
     }
     private val bmpPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    // ---- procedural parchment background ----
+    private var parchment: Bitmap? = null
+
+    /** 0..100 — light cream .. deep kraft */
+    var paperTone = 50
+    /** 0..100 — flat .. heavily mottled */
+    var paperTexture = 65
+
+    fun refreshPaper() {
+        parchment?.recycle()
+        parchment = null
+        invalidate()
+    }
+
+    private fun parchmentBitmap(): Bitmap? {
+        if (width == 0 || height == 0) return null
+        parchment?.let { return it }
+        parchment = generateParchment(width, height, paperTone / 100f, paperTexture / 100f)
+        return parchment
+    }
+
+    /** Soft blotches at quarter res + tiled grain + vignette. */
+    private fun generateParchment(w: Int, h: Int, tone: Float, tex: Float): Bitmap {
+        fun lerp(a: Int, b: Int) = (a + (b - a) * tone).toInt()
+        val base = Color.rgb(lerp(247, 203), lerp(242, 180), lerp(230, 140))
+        val rnd = java.util.Random(7)
+
+        val small = Bitmap.createBitmap(w / 4, h / 4, Bitmap.Config.ARGB_8888)
+        val sc = Canvas(small)
+        sc.drawColor(base)
+        val bp = Paint(Paint.ANTI_ALIAS_FLAG)
+        repeat(200) {
+            val cx = rnd.nextInt(small.width).toFloat()
+            val cy = rnd.nextInt(small.height).toFloat()
+            val r = (18 + rnd.nextInt(70)).toFloat()
+            val a = ((16 + rnd.nextInt(30)) * tex).toInt().coerceIn(0, 255)
+            val col = if (rnd.nextBoolean()) Color.argb(a, 92, 70, 40) else Color.argb(a, 255, 252, 238)
+            bp.shader = RadialGradient(cx, cy, r, col, Color.TRANSPARENT, Shader.TileMode.CLAMP)
+            sc.drawCircle(cx, cy, r, bp)
+        }
+        bp.shader = null
+
+        val big = Bitmap.createScaledBitmap(small, w, h, true)
+        small.recycle()
+        val bc = Canvas(big)
+
+        val tile = Bitmap.createBitmap(128, 128, Bitmap.Config.ARGB_8888)
+        val px = IntArray(128 * 128)
+        for (i in px.indices) {
+            if (rnd.nextInt(4) == 0) {
+                val bright = rnd.nextBoolean()
+                val a = ((10 + rnd.nextInt(26)) * tex).toInt().coerceIn(0, 255)
+                px[i] = if (bright) Color.argb(a, 255, 250, 232) else Color.argb(a, 70, 52, 28)
+            }
+        }
+        tile.setPixels(px, 0, 128, 0, 0, 128, 128)
+        val gp = Paint()
+        gp.shader = BitmapShader(tile, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
+        bc.drawRect(0f, 0f, w.toFloat(), h.toFloat(), gp)
+
+        val vg = Paint()
+        vg.shader = RadialGradient(
+            w / 2f, h / 2f, maxOf(w, h) * 0.72f,
+            intArrayOf(Color.TRANSPARENT, Color.TRANSPARENT, Color.argb((40 * tex).toInt(), 74, 54, 26)),
+            floatArrayOf(0f, 0.68f, 1f), Shader.TileMode.CLAMP,
+        )
+        bc.drawRect(0f, 0f, w.toFloat(), h.toFloat(), vg)
+        return big
+    }
 
     init {
         setBackgroundColor(Color.WHITE)
@@ -222,7 +295,8 @@ class DiaryView(context: Context) : View(context) {
     private fun quantizeAlpha(a: Float): Float = Math.round(a * 4f) / 4f
 
     override fun onDraw(canvas: Canvas) {
-        canvas.drawColor(Color.WHITE)
+        parchmentBitmap()?.let { canvas.drawBitmap(it, 0f, 0f, null) }
+            ?: canvas.drawColor(Color.WHITE)
         if (absorbBands.isNotEmpty()) {
             // Absorb phase: small band bitmaps in write order, per-band level (stepped), minimal redraw cost.
             for (i in absorbBands.indices) {

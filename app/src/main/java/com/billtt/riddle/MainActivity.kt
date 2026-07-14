@@ -11,6 +11,7 @@ import android.view.WindowManager
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.RadioButton
+import android.widget.SeekBar
 import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
@@ -28,7 +29,10 @@ class MainActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         prefs = Prefs(this)
-        diaryView = DiaryView(this)
+        diaryView = DiaryView(this).also {
+            it.paperTone = prefs.paperTone
+            it.paperTexture = prefs.paperTexture
+        }
         controller = DiaryController(this, diaryView, prefs)
         setContentView(diaryView)
 
@@ -180,9 +184,32 @@ class MainActivity : Activity() {
             setPadding(0, pad / 2, 0, 0)
         }
 
+        // ---- paper appearance ----
+        val paperLabel = TextView(this).apply {
+            text = "纸张 — 色深 / 纹理强度（拖动松手即预览）"
+            textSize = 13f
+            setPadding(0, pad, 0, 0)
+        }
+        val toneSeek = SeekBar(this).apply { max = 100; progress = prefs.paperTone }
+        val textureSeek = SeekBar(this).apply { max = 100; progress = prefs.paperTexture }
+        val livePreview = object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, p: Int, u: Boolean) {}
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {
+                diaryView.paperTone = toneSeek.progress
+                diaryView.paperTexture = textureSeek.progress
+                diaryView.refreshPaper()
+            }
+        }
+        toneSeek.setOnSeekBarChangeListener(livePreview)
+        textureSeek.setOnSeekBarChangeListener(livePreview)
+
         layout.addView(providerGroup)
         layout.addView(anthropicFields)
         layout.addView(openaiFields)
+        layout.addView(paperLabel)
+        layout.addView(toneSeek)
+        layout.addView(textureSeek)
         layout.addView(hint)
 
         fun applyVisibility(openai: Boolean) {
@@ -212,11 +239,18 @@ class MainActivity : Activity() {
                 prefs.openaiKey = openaiKeyInput.text.toString()
                 prefs.openaiModel = openaiModelInput.text.toString()
                 prefs.openaiBaseUrl = openaiBaseUrlInput.text.toString()
+                prefs.paperTone = toneSeek.progress
+                prefs.paperTexture = textureSeek.progress
                 if (!prefs.configured) {
                     Toast.makeText(this, R.string.toast_need_key, Toast.LENGTH_LONG).show()
                 }
             }
-            .setOnDismissListener { controller.onResume() }
+            .setOnDismissListener {
+                diaryView.paperTone = prefs.paperTone
+                diaryView.paperTexture = prefs.paperTexture
+                diaryView.refreshPaper()
+                controller.onResume()
+            }
             .show()
     }
 }

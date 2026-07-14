@@ -35,6 +35,15 @@ class Prefs(context: Context) {
         set(value) = sp.edit()
             .putString("openai_base_url", value.trim().ifEmpty { OpenAiOracle.DEFAULT_BASE_URL }).apply()
 
+    // ---- paper appearance ----
+    var paperTone: Int
+        get() = sp.getInt("paper_tone", 50)
+        set(value) = sp.edit().putInt("paper_tone", value.coerceIn(0, 100)).apply()
+
+    var paperTexture: Int
+        get() = sp.getInt("paper_texture", 65)
+        set(value) = sp.edit().putInt("paper_texture", value.coerceIn(0, 100)).apply()
+
     /** Whether the currently selected backend has its API key configured. */
     val configured: Boolean
         get() = if (provider == PROVIDER_OPENAI) openaiKey.isNotEmpty() else apiKey.isNotEmpty()

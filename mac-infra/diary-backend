@@ -1,0 +1,45 @@
+#!/bin/zsh
+# Switch the Boox riddle-diary backend between:
+#   diary-backend b          Claude Max subscription via Mac proxy (route B)
+#   diary-backend a <key>    GLM-4V-Flash direct, free (route A; key saved after first use)
+#   diary-backend status     show current on-device config
+set -e
+CONF="$HOME/.config/boox-usage.conf"; source "$CONF" 2>/dev/null
+BOOX="${BOOX_ADDR:?set BOOX_ADDR=<boox-ip>:5555}"
+GLM_KEY_FILE="$HOME/.config/diary-glm.key"
+MAC_IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1)
+
+adb connect "$BOOX" >/dev/null
+
+write_prefs() {  # $1=key $2=base_url $3=model
+  adb -s "$BOOX" shell "run-as com.billtt.riddle sh -c 'cat > shared_prefs/riddle.xml'" <<EOF
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <string name="provider">openai</string>
+    <string name="openai_key">$1</string>
+    <string name="openai_base_url">$2</string>
+    <string name="openai_model">$3</string>
+</map>
+EOF
+  adb -s "$BOOX" shell "am force-stop com.billtt.riddle; am start -n com.billtt.riddle/.MainActivity" >/dev/null
+}
+
+case "$1" in
+  b)
+    write_prefs "${DIARY_PROXY_TOKEN:-change-me}" "http://$MAC_IP:7272/v1" "haiku"
+    echo "→ route B: Claude subscription via $MAC_IP:7272 (persistent session)"
+    ;;
+  a)
+    [[ -n "$2" ]] && echo "$2" > "$GLM_KEY_FILE"
+    KEY=$(cat "$GLM_KEY_FILE" 2>/dev/null)
+    [[ -z "$KEY" ]] && { echo "usage: diary-backend a <GLM_API_KEY>  (first time)" >&2; exit 1 }
+    write_prefs "$KEY" "https://open.bigmodel.cn/api/paas/v4" "glm-4v-flash"
+    echo "→ route A: GLM-4V-Flash direct (free)"
+    ;;
+  status)
+    adb -s "$BOOX" shell "run-as com.billtt.riddle cat shared_prefs/riddle.xml" | grep -E "base_url|model"
+    ;;
+  *)
+    echo "usage: diary-backend {a [key]|b|status}" >&2; exit 1
+    ;;
+esac

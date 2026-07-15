@@ -16,6 +16,11 @@ import com.onyx.android.sdk.api.device.epd.UpdateMode
  */
 object EInk {
 
+    /** Writing phase: A2/animation binary fast mode — lowest latency for live ink. */
+    fun beginWriting(view: View) {
+        runCatching { EpdController.setViewDefaultUpdateMode(view, UpdateMode.ANIMATION) }
+    }
+
     /** Enter the animation phase: set this view's default refresh mode to DU4 fast refresh. */
     fun beginAnimation(view: View) {
         runCatching { EpdController.setViewDefaultUpdateMode(view, UpdateMode.DU4) }

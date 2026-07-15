@@ -46,7 +46,8 @@ object ReplyTypesetter {
 
     fun layout(text: String, pageWidth: Int, pageHeight: Int, paint: Paint): ReplyLayout {
         val cjk = containsCjk(text)
-        var textSize = pageWidth / 24f
+        // Tangerine's x-height is small; western text needs a larger base size
+        var textSize = if (cjk) pageWidth / 24f else pageWidth / 18f
         val maxWidth = pageWidth * 0.78f
         val topStart = pageHeight * 0.30f
         val maxBottom = pageHeight * 0.85f
@@ -56,7 +57,7 @@ object ReplyTypesetter {
             paint.textSize = textSize
             words = flow(tokenize(text, cjk), cjk, maxWidth, pageWidth, topStart, paint)
             val bottom = words.lastOrNull()?.y ?: topStart
-            if (bottom <= maxBottom || textSize <= pageWidth / 40f) break
+            if (bottom <= maxBottom || textSize <= (if (cjk) pageWidth / 40f else pageWidth / 30f)) break
             textSize *= 0.88f
         }
         return ReplyLayout(words, textSize, cjk)

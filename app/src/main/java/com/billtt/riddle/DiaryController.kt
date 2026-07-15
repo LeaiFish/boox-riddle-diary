@@ -4,11 +4,14 @@ import android.app.Activity
 import android.graphics.Rect
 import android.util.Log
 import android.widget.Toast
+import com.onyx.android.sdk.api.device.epd.EpdController
+import com.onyx.android.sdk.pen.EpdPenManager
 import com.onyx.android.sdk.pen.RawInputCallback
 import com.onyx.android.sdk.pen.TouchHelper
 import com.onyx.android.sdk.data.note.TouchPoint
 import com.onyx.android.sdk.pen.data.TouchPointList
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -37,6 +40,13 @@ class DiaryController(
 
     @Volatile var state = State.WRITING
         private set
+    @Volatile private var penResumeRequested = false
+    @Volatile private var lastPenMs = 0L
+
+    /** Settings gesture only on a blank, quiet page — a palm resting mid-writing never qualifies. */
+    fun settingsGestureAllowed(): Boolean =
+        state == State.WRITING && view.strokes.isEmpty() &&
+            System.currentTimeMillis() - lastPenMs > 3000L
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var touchHelper: TouchHelper? = null
@@ -74,7 +84,13 @@ class DiaryController(
             // pen-point callbacks; the default SurfaceFlinger hardware-draw mode does not
             // fire callbacks under this firmware. Live ink during writing is therefore
             // drawn in software by DiaryView (see the move callback / addLivePoint).
-            touchHelper = TouchHelper.create(view, TouchHelper.FEATURE_APP_TOUCH_RENDER, rawCallback)
+            touchHelper = if (HW_PEN_RENDER) {
+                // T10C: default SurfaceFlinger hardware-draw mode — EPD renders live ink
+                // itself with near-zero latency, callbacks still record the stroke.
+                TouchHelper.create(view, rawCallback)
+            } else {
+                TouchHelper.create(view, TouchHelper.FEATURE_APP_TOUCH_RENDER, rawCallback)
+            }
                 .setStrokeWidth(view.baseStrokeWidth)
                 .setStrokeStyle(TouchHelper.STROKE_STYLE_PENCIL)
                 .setLimitRect(limit, ArrayList())
@@ -82,13 +98,18 @@ class DiaryController(
             touchHelper?.setRawInputReaderEnable(true)
             touchHelper?.setRawDrawingRenderEnabled(true)
             touchHelper?.setRawDrawingEnabled(true)
+            if (EPD_STROKE_RENDER) {
+                EpdController.setStrokeStyle(EpdController.STROKE_STYLE_PENCIL)
+                EpdController.setStrokeWidth(view.baseStrokeWidth)
+                EpdController.setScreenHandWritingPenState(view, EpdPenManager.PEN_START)
+            }
         }.isSuccess
         Log.i(TAG, "attach: limit=$limit touchHelper=${if (touchHelper != null) "ok" else "null"} ok=$ok")
         if (!ok) {
             touchHelper = null
             Toast.makeText(activity, R.string.toast_not_boox, Toast.LENGTH_LONG).show()
         }
-        EInk.beginAnimation(view)
+        EInk.beginWriting(view)
     }
 
     /** Resume writing: re-enable raw pen input, only in the writing state. Called when the
@@ -135,24 +156,41 @@ class DiaryController(
     // --------------------------------------------------------- raw pen callbacks
     // Note: these fire on Onyx SDK background threads and are all posted to the main thread.
 
+
+    private val penPauseRunnable = Runnable {
+        runCatching { EpdController.setScreenHandWritingPenState(view, EpdPenManager.PEN_PAUSE) }
+    }
+
     private val rawCallback = object : RawInputCallback() {
 
         override fun onBeginRawDrawing(shortcut: Boolean, point: TouchPoint) {
+            lastPenMs = System.currentTimeMillis()
+            if (state == State.LINGERING || state == State.FADING_REPLY) penResumeRequested = true
+            if (EPD_STROKE_RENDER) runCatching {
+                view.removeCallbacks(penPauseRunnable)
+                EpdController.setScreenHandWritingPenState(view, EpdPenManager.PEN_DRAWING)
+                EpdController.startStroke(view.baseStrokeWidth, point.x, point.y, point.pressure, point.size, point.timestamp.toFloat())
+            }
             val p = StrokePoint(point.x, point.y, normalizePressure(point.pressure))
             view.post {
                 view.removeCallbacks(idleRunnable)
+                cancelSpeculation()
                 pendingPoints.clear()
                 view.beginLiveStroke()
                 pendingPoints.add(p)
-                view.addLivePoint(p)
+                if (!HW_PEN_RENDER && !EPD_STROKE_RENDER) view.addLivePoint(p)
             }
         }
 
         override fun onRawDrawingTouchPointMoveReceived(point: TouchPoint) {
+            lastPenMs = System.currentTimeMillis()
+            if (EPD_STROKE_RENDER) runCatching {
+                EpdController.addStrokePoint(view.baseStrokeWidth, point.x, point.y, point.pressure, point.size, point.timestamp.toFloat())
+            }
             val p = StrokePoint(point.x, point.y, normalizePressure(point.pressure))
             view.post {
                 pendingPoints.add(p)
-                view.addLivePoint(p)   // live partial draw + local fast refresh
+                if (!HW_PEN_RENDER && !EPD_STROKE_RENDER) view.addLivePoint(p)   // live partial draw + local fast refresh
             }
         }
 
@@ -167,6 +205,11 @@ class DiaryController(
         }
 
         override fun onEndRawDrawing(outLimitRegion: Boolean, point: TouchPoint) {
+            if (EPD_STROKE_RENDER) runCatching {
+                EpdController.finishStroke(view.baseStrokeWidth, point.x, point.y, point.pressure, point.size, point.timestamp.toFloat())
+                EpdController.penUp()
+                view.postDelayed(penPauseRunnable, 800L)
+            }
             Log.i(TAG, "onEndRawDrawing strokes=${view.strokes.size} pending=${pendingPoints.size}")
             view.post {
                 if (view.strokes.isEmpty() && pendingPoints.size >= 2) {
@@ -179,7 +222,10 @@ class DiaryController(
         }
 
         override fun onBeginRawErasing(shortcut: Boolean, point: TouchPoint) {
-            view.post { view.removeCallbacks(idleRunnable) }
+            view.post {
+                view.removeCallbacks(idleRunnable)
+                cancelSpeculation()
+            }
         }
 
         override fun onRawErasingTouchPointMoveReceived(point: TouchPoint) {}
@@ -214,9 +260,33 @@ class DiaryController(
 
     private fun scheduleIdleCheck() {
         view.removeCallbacks(idleRunnable)
+        view.removeCallbacks(speculateRunnable)
         if (state == State.WRITING && view.strokes.isNotEmpty()) {
             view.postDelayed(idleRunnable, IDLE_MS)
+            view.postDelayed(speculateRunnable, SPECULATE_MS)
         }
+    }
+
+    // Early speculative request: capture the page after a short rest and start the AI
+    // call before the absorb threshold. If the pen comes back down, the in-flight
+    // request is cancelled and a fresh one fires at the next rest. Captures are
+    // in-memory byte arrays — nothing accumulates on disk.
+    private var specDeferred: Deferred<Result<String>>? = null
+
+    private val speculateRunnable = Runnable {
+        if (state != State.WRITING || view.strokes.isEmpty()) return@Runnable
+        val oracle = OracleFactory.create(prefs) ?: return@Runnable
+        specDeferred?.cancel()
+        specDeferred = scope.async {
+            val png = withContext(Dispatchers.Default) { view.capturePagePng() }
+            withContext(Dispatchers.IO) { runCatching { oracle.ask(png) } }
+        }
+    }
+
+    private fun cancelSpeculation() {
+        view.removeCallbacks(speculateRunnable)
+        specDeferred?.cancel()
+        specDeferred = null
     }
 
     private fun onIdle() {
@@ -228,22 +298,31 @@ class DiaryController(
 
     private fun startCycle() {
         state = State.ABSORBING
+        if (EPD_STROKE_RENDER) runCatching {
+            view.removeCallbacks(penPauseRunnable)
+            EpdController.setScreenHandWritingPenState(view, EpdPenManager.PEN_PAUSE)
+        }
         skipLingerRequested = false
-        touchHelper?.setRawDrawingEnabled(false)
 
         cycleJob = scope.launch {
-            // Take over the on-screen ink with software rendering (same content as live ink).
+            // Seamless overlay handoff: paint the recorded strokes into the view's own
+            // buffer FIRST (invisible while raw drawing holds the screen), so the refresh
+            // triggered by disabling raw drawing swaps to identical content — no flash.
             EInk.animateFrame(view)
+            delay(FRAME_MS * 2)
+            touchHelper?.setRawDrawingEnabled(false)
             delay(FRAME_MS)
 
-            // Fire the AI request immediately, so recognition runs in parallel with the absorb animation.
-            val png = withContext(Dispatchers.Default) { view.capturePagePng() }
-            val oracle = OracleFactory.create(prefs)
-            val replyDeferred = oracle?.let {
-                async(Dispatchers.IO) {
-                    runCatching { it.ask(png) }
+            // Prefer the speculative request fired after SPECULATE_MS of pen rest;
+            // fall back to capture-and-ask now (still parallel with the absorb animation).
+            val replyDeferred = specDeferred ?: OracleFactory.create(prefs)?.let { oracle ->
+                async {
+                    val png = withContext(Dispatchers.Default) { view.capturePagePng() }
+                    withContext(Dispatchers.IO) { runCatching { oracle.ask(png) } }
                 }
             }
+            specDeferred = null
+            view.removeCallbacks(speculateRunnable)
 
             animateAbsorb()
             view.clearStrokes()
@@ -265,15 +344,27 @@ class DiaryController(
             animateReveal()
 
             state = State.LINGERING
+            // Pen is live from here on: starting to write interrupts the reply instantly.
+            touchHelper?.setRawDrawingEnabled(true)
             lingerInterruptibly(lingerMillisFor(view.replyWords.size))
 
-            state = State.FADING_REPLY
-            animateReplyFade()
-            view.clearReply()
-            EInk.fullRefresh(view)
+            if (penResumeRequested) {
+                // Writer already has the pen down — wipe the reply fast, no ceremony.
+                view.clearReply()
+                EInk.animateFrame(view)
+            } else {
+                state = State.FADING_REPLY
+                animateReplyFade()
+                view.clearReply()
+                // GC deghost only when idle; never while ink is being written above.
+                if (penResumeRequested) EInk.animateFrame(view) else EInk.fullRefresh(view)
+            }
 
             state = State.WRITING
+            EInk.beginWriting(view)
             touchHelper?.setRawDrawingEnabled(true)
+            penResumeRequested = false
+            scheduleIdleCheck()
         }
     }
 
@@ -303,7 +394,8 @@ class DiaryController(
      * @param curve   given element i and time t, return its target level in [0,1]
      */
     private suspend fun runStagedFade(
-        count: Int, totalMs: Long, setA: (Int, Float) -> Unit, curve: (Int, Long) -> Float,
+        count: Int, totalMs: Long, setA: (Int, Float) -> Unit,
+        abort: () -> Boolean = { false }, curve: (Int, Long) -> Float,
     ) {
         if (count == 0) return
         val prev = IntArray(count) { Int.MIN_VALUE }
@@ -320,6 +412,7 @@ class DiaryController(
                 EInk.animateFrame(view)
                 delay(FRAME_MS)
             }
+            if (abort()) return
             t += SAMPLE_MS
         }
     }
@@ -342,25 +435,35 @@ class DiaryController(
         view.finishAbsorb()
     }
 
-    /** Reply reveal: words rise in order from faint gray to full ink. */
+    /** Reply reveal: a diagonal sweep — ink rises from the top-left to the bottom-right. */
     private suspend fun animateReveal() {
         val n = view.replyWords.size
-        runStagedFade(n, REVEAL_WORD_MS * (n - 1) + FADE_MS, { i, a -> view.wordAlphas[i] = a }) { i, t ->
-            val local = (t - i * REVEAL_WORD_MS).coerceAtLeast(0L)
-            (local.toFloat() / FADE_MS).coerceIn(0f, 1f)
+        if (n == 0) return
+        val starts = sweepStarts()
+        runStagedFade(n, REVEAL_SWEEP_MS + FADE_MS, { i, a -> view.wordAlphas[i] = a }) { i, t ->
+            ((t - starts[i]).coerceAtLeast(0L).toFloat() / FADE_MS).coerceIn(0f, 1f)
         }
         for (i in 0 until n) view.wordAlphas[i] = 1f
         EInk.animateFrame(view)
     }
 
-    /** Reply fade: the reverse of reveal — words sink back into the page in order. */
+    /** Reply fade: the same diagonal sweep, sinking back into the page. */
     private suspend fun animateReplyFade() {
         val n = view.replyWords.size
-        val stagger = if (n > 0) (ABSORB_TOTAL_STAGGER_MS / n).coerceIn(50L, REVEAL_WORD_MS) else 0L
-        runStagedFade(n, stagger * (n - 1) + FADE_MS, { i, a -> view.wordAlphas[i] = a }) { i, t ->
-            val local = (t - i * stagger).coerceAtLeast(0L)
-            (1f - local.toFloat() / FADE_MS).coerceIn(0f, 1f)
+        if (n == 0) return
+        val starts = sweepStarts()
+        runStagedFade(n, REVEAL_SWEEP_MS + FADE_MS, { i, a -> view.wordAlphas[i] = a },
+            abort = { penResumeRequested }) { i, t ->
+            (1f - (t - starts[i]).coerceAtLeast(0L).toFloat() / FADE_MS).coerceIn(0f, 1f)
         }
+    }
+
+    /** Per-word start delays proportional to x+y (top-left first, bottom-right last). */
+    private fun sweepStarts(): LongArray {
+        val keys = FloatArray(view.replyWords.size) { view.replyWords[it].x + view.replyWords[it].y }
+        val minK = keys.minOrNull() ?: 0f
+        val span = ((keys.maxOrNull() ?: 0f) - minK).coerceAtLeast(1f)
+        return LongArray(keys.size) { (REVEAL_SWEEP_MS * (keys[it] - minK) / span).toLong() }
     }
 
     private fun lingerMillisFor(wordCount: Int): Long =
@@ -368,18 +471,26 @@ class DiaryController(
 
     private suspend fun lingerInterruptibly(millis: Long) {
         var waited = 0L
-        while (waited < millis && !skipLingerRequested) {
+        while (waited < millis && !skipLingerRequested && !penResumeRequested) {
             delay(120)
             waited += 120
         }
     }
 
     companion object {
+        /** Try the hardware pen-render path (works on some firmwares, e.g. T10C; Note X2 needs false). */
+        const val HW_PEN_RENDER = true
+        /** EXPERIMENT: draw live ink via EpdController.startStroke/addStrokePoint —
+         *  the EPD accelerated hand-writing overlay (untested by upstream on this path). */
+        const val EPD_STROKE_RENDER = false
+
         const val TAG = "RiddleDiary"
 
         /** How long the pen must rest to count as "a passage finished" and trigger absorption
          *  (the original riddle project uses 2.8s). */
-        const val IDLE_MS = 2800L
+        const val IDLE_MS = 2000L
+        const val SPECULATE_MS = 800L   // early page capture + AI request while waiting for IDLE_MS
+        const val REVEAL_SWEEP_MS = 900L
 
         /** Minimum interval after each real refresh — DU4 fast refresh is ~150ms. */
         const val FRAME_MS = 130L

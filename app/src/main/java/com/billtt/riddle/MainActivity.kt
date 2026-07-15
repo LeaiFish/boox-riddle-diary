@@ -35,7 +35,7 @@ class MainActivity : Activity() {
         // Long-press with a finger -> settings; any touch during linger -> skip the wait.
         gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onLongPress(e: MotionEvent) {
-                showSettingsDialog()
+                if (controller.settingsGestureAllowed()) showSettingsDialog()
             }
         })
         diaryView.setOnTouchListener { _, event -> handleTouch(event) }

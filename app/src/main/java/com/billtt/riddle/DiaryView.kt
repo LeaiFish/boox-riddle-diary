@@ -65,7 +65,7 @@ class DiaryView(context: Context) : View(context) {
 
     companion object {
         /** Throttle interval (ms) for the local live-ink refresh. */
-        const val LIVE_THROTTLE_MS = 45L
+        const val LIVE_THROTTLE_MS = 20L
 
         /** Number of bands the absorb animation splits strokes into, in write order
          *  (more = finer ordering, a few more bitmaps drawn per frame). */
@@ -212,7 +212,7 @@ class DiaryView(context: Context) : View(context) {
 
     private fun pickTypeface(text: String): Typeface {
         val cjk = text.any { Character.UnicodeBlock.of(it) == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS }
-        val fontRes = if (cjk) R.font.ma_shan_zheng else R.font.dancing_script
+        val fontRes = if (cjk) R.font.ma_shan_zheng else R.font.tangerine_bold
         return runCatching { resources.getFont(fontRes) }.getOrDefault(Typeface.SERIF)
     }
 
@@ -246,7 +246,7 @@ class DiaryView(context: Context) : View(context) {
         for (j in 1 until currentPoints.size) {
             val a = currentPoints[j - 1]
             val b = currentPoints[j]
-            inkPaint.strokeWidth = baseStrokeWidth * (0.6f + 0.8f * b.pressure)
+            inkPaint.strokeWidth = baseStrokeWidth * (0.5f + 0.64f * b.pressure)
             canvas.drawLine(a.x, a.y, b.x, b.y, inkPaint)
         }
     }
@@ -265,7 +265,7 @@ class DiaryView(context: Context) : View(context) {
         for (j in 1 until pts.size) {
             val a = pts[j - 1]
             val b = pts[j]
-            paint.strokeWidth = baseStrokeWidth * (0.6f + 0.8f * b.pressure)
+            paint.strokeWidth = baseStrokeWidth * (0.5f + 0.64f * b.pressure)
             canvas.drawLine(a.x, a.y, b.x, b.y, paint)
         }
     }

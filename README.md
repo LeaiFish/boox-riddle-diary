@@ -99,23 +99,58 @@ Two ways to have Claude play the diary:
 Any other OpenAI-compatible vision endpoint works the same way (tested:
 `glm-4v-plus`).
 
-### Setup
+### Build & run
 
-1. Build with Android Studio or `./gradlew assembleDebug` (JDK 17, SDK 34).
-2. `adb install -r app-debug.apk`, then un-freeze:
-   `adb shell pm enable com.billtt.riddle`
-3. Unlock the pen pipeline: `adb shell settings put global hidden_api_policy 1`
-4. First launch shows settings: pick a backend, paste an API key. Any
-   OpenAI-compatible endpoint with a **vision** model works
-   (tested: `glm-4v-plus`; the model must see your handwriting).
-5. Write. Rest the pen ~2s. Wait for the ink to answer.
+Grab the debug-signed APK from [Releases](../../releases), or build it yourself.
+Either way you need a computer with adb — this is not a tap-to-install app,
+because the pen unlock below can **only** be set over adb (it needs a privileged
+setting no app can flip itself). With USB debugging enabled on the device:
 
-Experimental shelved features live in branches: procedural parchment paper
-background with in-app sliders, and blood-red accent keywords in replies.
+```bash
+# option A — prebuilt APK from the Releases page:
+adb install -r riddle-diary.apk
+
+# option B — build from source (JDK 17, SDK 34):
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+
+# then, either way:
+adb shell pm enable com.billtt.riddle             # BOOX freezes newly installed apps
+adb shell settings put global hidden_api_policy 1 # unlock the hardware pen pipeline
+```
+
+On first launch the app asks for a backend and API key (see *Using Claude
+models* above). Any OpenAI-compatible **vision** endpoint works — the model has
+to be able to read your handwriting from an image.
+
+If writing produces no ink, the pen pipeline didn't unlock: re-check the last
+command and run the `PenProbeActivity` diagnostic above.
+
+### The writing loop
+
+Write on the blank page and the ink appears under the pen in real time. Rest the
+pen for about two seconds and the page drinks your handwriting, fading it away in
+the order you wrote it; a beat later the diary answers, its reply rising word by
+word from the top-left corner. The reply lingers and then sinks back into the
+page on its own — but the pen is live the whole time, so **the moment you start
+writing again the reply gives way** (a finger tap dismisses it too). To reach
+the settings dialog, long-press the page with a finger while it's blank; a palm
+resting mid-sentence won't trigger it. The pen's eraser end clears whole strokes.
+
+Two experimental features live on their own branches: a procedural parchment
+paper background with in-app tone/texture sliders (`parchment-paper`), and
+blood-red accent keywords the model marks in its replies (`red-accent-ink`).
 
 ### License
 
 MIT, same as upstream. Font licenses in `FONT_LICENSE_OFL.txt`.
+
+### Acknowledgements
+
+Built on [billtt/boox-riddle-diary](https://github.com/billtt/boox-riddle-diary)
+and the original idea by [MaximeRivest](https://github.com/MaximeRivest/riddle).
+The fork's development — the hidden-API diagnosis, the pen pipeline, and the
+rest — was done with [Claude Code](https://claude.com/claude-code).
 
 ---
 
@@ -196,19 +231,49 @@ Android 11+ 的 BOOX 设备未经测试——理论上同一个隐藏 API 修复
 
 其他任何 OpenAI 兼容的视觉模型接口同样可用（实测：`glm-4v-plus`）。
 
-### 上手
+### 构建与运行
 
-1. 用 Android Studio 或 `./gradlew assembleDebug` 编译（JDK 17，SDK 34）。
-2. `adb install -r app-debug.apk`，然后解冻：
-   `adb shell pm enable com.billtt.riddle`
-3. 解锁手写管线：`adb shell settings put global hidden_api_policy 1`
-4. 首次启动会弹设置：选择后端、填入 API key。任何 OpenAI 兼容接口的
-   **视觉**模型均可（实测：`glm-4v-plus`；模型必须能看你的手写截图）。
-5. 写字。停笔约 2 秒。等墨水回答你。
+从 [Releases](../../releases) 下载 debug 签名的 APK，或自行编译。无论哪种方式都
+需要一台带 adb 的电脑——它**不是**点一下就能装的应用，因为下面的手写解锁**只能**
+通过 adb 设置（那是普通 app 无权翻动的特权开关）。在设备上开启 USB 调试后：
 
-实验性功能封存在分支中：程序化羊皮纸背景（应用内滑杆调节）、
-模型标注的血红关键词。
+```bash
+# 方式 A —— 用 Releases 页的预编译 APK：
+adb install -r riddle-diary.apk
+
+# 方式 B —— 从源码编译（JDK 17，SDK 34）：
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+
+# 然后，两种方式都要：
+adb shell pm enable com.billtt.riddle             # BOOX 会冻结新装应用
+adb shell settings put global hidden_api_policy 1 # 解锁硬件手写管线
+```
+
+首次启动时 app 会询问后端与 API Key（见上文《连接 Claude 模型》）。任何 OpenAI
+兼容的**视觉**接口都可以——模型必须能从截图里读出你的手写。
+
+若书写没有墨迹，说明手写管线未解锁：复查最后一条命令，并运行上文的
+`PenProbeActivity` 诊断页。
+
+### 书写的一轮
+
+在空白页上落笔，墨迹实时出现在笔尖下。停笔约两秒，纸面把你的字迹「喝」下去，
+按你书写的顺序淡去；片刻之后日记开始回信，回信从左上角逐字浮起。回信停留片刻
+后会自行沉回纸中——但笔全程是活的，**你一旦重新落笔，回信立即让位**（手指点一下
+也能让它消散）。想打开设置，在空白页上用手指长按即可；写到一半搁下的手掌不会
+误触。笔的橡皮端可整笔擦除。
+
+两个实验性功能各在独立分支：带应用内色深/纹理滑杆的程序化羊皮纸背景
+（`parchment-paper`），以及模型在回信中标注的血红关键词（`red-accent-ink`）。
 
 ### 许可
 
 MIT，与上游一致。字体许可见 `FONT_LICENSE_OFL.txt`。
+
+### 致谢
+
+基于 [billtt/boox-riddle-diary](https://github.com/billtt/boox-riddle-diary)
+及 [MaximeRivest](https://github.com/MaximeRivest/riddle) 的原始创意。本分支的
+开发——隐藏 API 的诊断、手写管线、以及其余部分——借助
+[Claude Code](https://claude.com/claude-code) 完成。
